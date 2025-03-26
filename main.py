@@ -3,63 +3,159 @@ import face_recognition
 import os
 import cv2
 import numpy as np
+import pickle
+import cvzone
+from datetime import datetime
 
-from time import sleep
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import db
 
-face_recognize_file = "test.jpg"
+#initialize firebase_admin
+cred = credentials.Certificate("serviceAccountKey.json")
+firebase_admin.initialize_app(cred, {
+  "databaseURL": "https://facerecognitionrealtime-68d6c-default-rtdb.europe-west1.firebasedatabase.app/"
+  # "storageBucket": "storage"
+})
 
-def get_encoded_faces():
-  encoded = {}
+#storage
+#bucket = storage.bucket()
 
-  for dirpath, dnames, fnames in os.walk("./faces"):
-    for f in fnames:
-      if f.endswith(".jpg") or f.endswith(".png"):
-        face = fr.load_image_file("faces/" + f)
-        encoding = fr.face_encodings(face)[0]
-        encoded[f.split(".")[0]] = encoding
-    
-  return encoded
+#cant use storage because its not part of the free plan (have to pay for it)
+#from firebase_admin import storage
 
-def unkown_image_encoded(img):
-  face = fr.load_image_file("faces/" + img)
-  encoding = fr.face_encodings(face)[0]
+cap = cv2.VideoCapture(1)
+#background.png size is 1280x720
+#image that will be fitted into background.png is 640x480
+cap.set(3, 640)
+cap.set(4, 480)
 
-  return encoding
+imgBackground = cv2.imread("Resources/background.png")
 
-def classify_face(im):
-  faces = get_encoded_faces()
-  faces_encoded = list(faces.values())
-  known_face_names = list(faces.keys())
+#images in resources/modes to list imgmodeList
+folderModePath = "Resources/Modes"
+modePathList = os.listdir(folderModePath)
+imgModeList = []
+for path in modePathList:
+  imgModeList.append(cv2.imread(os.path.join(folderModePath, path)))
+#print(len(imgModeList))
 
-  img = cv2.imread(im, 1)
+#load encoding file
+print("loading encode file...")
+file = open("EncodeFile.p", "rb")
+encodeListKnownWithIds = pickle.load(file)
+file.close()
+encodeListKnown, studentIds = encodeListKnownWithIds
+# print(studentIds)
+print("encode file loaded")
 
-  face_locations = face_recognition.face_locations(img)
-  unkown_face_encodings = face_recognition.face_encodings(img, face_locations)
+modeType = 0
+counter = 0
+id = -1
+imgStudent = []
+image_folder = "images"
 
-  face_names = []
-  for face_encoding in unkown_face_encodings:
-    matches = face_recognition.compare_faces(faces_encoded, face_encoding)
-    name = "Unknown"
+while True:
+  success, img = cap.read()
 
-    face_distances = face_recognition.face_distance(faces_encoded, face_encoding)
-    best_match_index = np.argmin(face_distances)
-    if matches[best_match_index]:
-      name = known_face_names[best_match_index]
+  #resize image to 1/4 size and convert to rgb
+  imgS = cv2.resize(img, (0, 0), None, 0.25, 0.25)
+  imgS = cv2.cvtColor(imgS,  cv2.COLOR_BGR2RGB)
 
-    face_names.append(name)
+  faceCurFrame = face_recognition.face_locations(imgS)
+  encodeCurFrame = face_recognition.face_encodings(imgS, faceCurFrame)
 
-    for (top, right, bottom, left), name in zip(face_locations, face_names):
-      cv2.rectangle(img, (left-20, top-20), (right+20, bottom+20), (255,0,0), 2)
+  #fits image "cap" into imgBackground
+  imgBackground[162:162+480, 55:55+640] = img
+  imgBackground[44:44+633, 808:808+414] = imgModeList[modeType]
+
+  if faceCurFrame:
+    for encodeFace, faceLoc in zip(encodeCurFrame, faceCurFrame):
+      matches = face_recognition.compare_faces(encodeListKnown, encodeFace)
+      faceDis = face_recognition.face_distance(encodeListKnown, encodeFace)
+      #print("matches", matches)
+      #print("faceDis", faceDis)
+
+      matchIndex = np.argmin(faceDis)
+      print("matchIndex", matchIndex)
+
+      if matches[matchIndex]:
+        print("Known Face Detected")
+        print(studentIds[matchIndex])
+        y1, x2, y2, x1 = faceLoc
+        y1, x2, y2, x1 = y1*4, x2*4, y2*4, x1*4
+        bbox = 55+x1, 162+y1, x2-x1, y2-y1
+        imgBackground = cvzone.cornerRect(imgBackground, bbox, rt=0)
+        id = studentIds[matchIndex]
+        #print(id)
+
+        if counter == 0:
+          cvzone.putTextRect(imgBackground, "Loading", (275,400))
+          cv2.imshow("Face Attendance", imgBackground)
+          cv2.waitKey(1)
+          counter = 1
+          modeType = 1
+
+    if counter != 0:
+      if counter == 1:
+        studentInfo = db.reference(f'Students/{id}').get()
+        print(studentInfo)
+        
+        #find image in folder images instead of getting them from db
+        image_path = os.path.join(image_folder, f"{id}.png")
+
+        #update data of attendance
+        dateTimeObject = datetime.strptime(studentInfo["last_attendance_time"], "%Y-%m-%d %H:%M:%S")
+        secondsElapsed = (datetime.now()-dateTimeObject).total_seconds()
+        print(secondsElapsed)
+
+        #update if secondsElapsed to realTime (30 is for testing purposes)
+        if secondsElapsed > 30:
+          ref = db.reference(f'Students/{id}')
+          studentInfo["total_attendance"] += 1
+          ref.child("total_attendance").set(studentInfo["total_attendance"])
+          ref.child("last_attendance_time").set(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        else:
+          modeType = 3
+          counter = 0
+          imgBackground[44:44+633, 808:808+414] = imgModeList[modeType]
       
-      cv2.rectangle(img, (left-20, bottom-15), (right+20, bottom+20), (255,0,0), cv2.FILLED)
-      font = cv2.FONT_HERSHEY_DUPLEX
-      cv2.putText(img, name, (left-20, bottom+15), font, 1.0, (255,255,255), 2)
-  
-  while True:
-    cv2.imshow(f"faces: {name}", img)
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-      return face_names
+      if modeType != 3:
+        if 10 < counter < 20:
+          modeType = 2
+        
+        imgBackground[44:44+633, 808:808+414] = imgModeList[modeType]
+        
+        if counter <=10:
+          cv2.putText(imgBackground, str(studentInfo["total_attendance"]), (861,125), cv2.FONT_HERSHEY_DUPLEX, 1, (0,0,0), 1)
+          cv2.putText(imgBackground, str(studentInfo["major"]), (1006,550), cv2.FONT_HERSHEY_DUPLEX, 0.5, (0,0,0), 1)
+          cv2.putText(imgBackground, str(id), (1006,493), cv2.FONT_HERSHEY_DUPLEX, 0.5, (0,0,0), 1)
+          cv2.putText(imgBackground, str(studentInfo["standing"]), (910,625), cv2.FONT_HERSHEY_DUPLEX, 0.6, (0,0,0), 1)
+          cv2.putText(imgBackground, str(studentInfo["year"]), (1025,625), cv2.FONT_HERSHEY_DUPLEX, 0.6, (0,0,0), 1)
+          cv2.putText(imgBackground, str(studentInfo["starting_year"]), (1125,625), cv2.FONT_HERSHEY_DUPLEX, 0.6, (0,0,0), 1)
+          
+          #centers text of name
+          (w, h), _ = cv2.getTextSize(studentInfo["name"], cv2.FONT_HERSHEY_DUPLEX,1,1)
+          offset = (414 - w) // 2
+          cv2.putText(imgBackground, str(studentInfo["name"]), (808 + offset, 445), cv2.FONT_HERSHEY_DUPLEX, 1, (0,0,0), 1)
 
-print(classify_face(face_recognize_file))
+          #import image to background logic
+          if os.path.exists(image_path):
+            imgStudent = cv2.imread(image_path)
+            imgBackground[175:175+216, 909:909+216] = imgStudent
 
+          counter += 1
 
+          if counter >= 20:
+            counter = 0
+            modeType = 0
+            studentInfo = []
+            imgStudent = []
+            imgBackground[44:44+633, 808:808+414] = imgModeList[modeType]
+  else:
+    modeType = 0
+    counter = 0
+
+  cv2.imshow("Webcam", img)
+  cv2.imshow("Face Attendance", imgBackground)
+  cv2.waitKey(1)
